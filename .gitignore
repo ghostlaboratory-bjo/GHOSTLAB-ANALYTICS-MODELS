@@ -1,0 +1,27 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.env
+.env.*
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Data + outputs (local-first)
+data/raw/
+data/processed/
+outputs/
+artifacts/
+logs/
+
+# Build
+dist/
+build/
+*.egg-info/
