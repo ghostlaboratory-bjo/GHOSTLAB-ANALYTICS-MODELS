@@ -12,6 +12,9 @@ dependencies = [
   "torch",
   "python-dotenv",
   "rich",
+  "scipy",
+  "google-cloud-bigquery",
+  "db-dtypes",
 ]
 
 [project.scripts]
