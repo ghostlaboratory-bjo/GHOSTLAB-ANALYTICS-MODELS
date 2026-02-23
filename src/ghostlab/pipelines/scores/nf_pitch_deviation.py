@@ -33,9 +33,10 @@ class ScoreNFConfig:
     pitch_types: Tuple[str, ...] = ("Fastball",)
     target_timesteps: int = 700
 
-    # None = all
-    days_back: Optional[int] = 30
+    # ✅ FULL REBUILD PHILOSOPHY: no "days_back" filtering in scoring.
+    # (Kept out of the config entirely on purpose.)
 
+    # Optional: still allow selecting a specific baseline run; otherwise we pick latest
     baseline_run_id: Optional[str] = None
 
     gcp_project: str = ""
@@ -45,7 +46,7 @@ class ScoreNFConfig:
     pitch_core_table: str = "pitch_core_v1"
     nf_time_series_table: str = "gold_newtforce_time_series"
 
-    # ✅ NEW: baselines now live in baseline_model_velocity|accuracy (no meta/ts split)
+    # ✅ baselines live in baseline_model_velocity|accuracy
     bq_baseline_table_base: str = "baseline_model"
 
     # Outputs
@@ -129,6 +130,9 @@ def _resample_one_pitch(pitch_ts: pd.DataFrame, weight_lb: float, T: int) -> Opt
     out = np.zeros((len(TS_FEATURES), T), dtype=np.float32)
 
     for j, feat in enumerate(TS_FEATURES):
+        if feat not in pitch_ts.columns:
+            return None
+
         v = pitch_ts[feat].to_numpy(dtype=np.float64)
         if np.all(~np.isfinite(v)):
             return None
@@ -255,16 +259,16 @@ def _fetch_baseline_ts(cfg: ScoreNFConfig, baseline_run_id: str) -> pd.DataFrame
 
 
 def _fetch_pitches_to_score(cfg: ScoreNFConfig) -> pd.DataFrame:
+    """
+    FULL rebuild: fetch ALL eligible pitches (no days_back filter).
+    Note: pitch_types still applies (by design).
+    """
     client = bq_client(BQConfig(project=cfg.gcp_project, location=cfg.bq_location))
 
-    days_clause = ""
     params: List[bigquery.QueryParameter] = [
         bigquery.ScalarQueryParameter("dataset_id", "STRING", cfg.dataset_id),
         bigquery.ArrayQueryParameter("pitch_types", "STRING", list(cfg.pitch_types)),
     ]
-    if cfg.days_back and int(cfg.days_back) > 0:
-        days_clause = "AND session_date >= DATE_SUB(CURRENT_DATE(), INTERVAL @days_back DAY)"
-        params.append(bigquery.ScalarQueryParameter("days_back", "INT64", int(cfg.days_back)))
 
     sql = f"""
     SELECT
@@ -294,9 +298,8 @@ def _fetch_pitches_to_score(cfg: ScoreNFConfig) -> pd.DataFrame:
       AND has_nf_timeseries = TRUE
       AND nf_file_name IS NOT NULL
       AND player_weight_lb IS NOT NULL
-      AND player_weight_lb > 0
+      AND SAFE_CAST(player_weight_lb AS FLOAT64) > 0
       AND TaggedPitchType IN UNNEST(@pitch_types)
-      {days_clause}
     """
     df = client.query(sql, job_config=bigquery.QueryJobConfig(query_parameters=params)).to_dataframe()
     if df.empty:
@@ -394,13 +397,21 @@ def _score_similarity(dist_all: float) -> float:
 
 def _write_df_to_bq(cfg: ScoreNFConfig, df: pd.DataFrame, table_fq: str, disposition: str) -> None:
     client = bq_client(BQConfig(project=cfg.gcp_project, location=cfg.bq_location))
-    job = client.load_table_from_dataframe(df, table_fq, job_config=bigquery.LoadJobConfig(write_disposition=disposition))
+    job = client.load_table_from_dataframe(
+        df,
+        table_fq,
+        job_config=bigquery.LoadJobConfig(write_disposition=disposition),
+    )
     job.result()
 
 
 def score_nf_pitches(cfg: ScoreNFConfig) -> Dict[str, int]:
     created_at = datetime.now(timezone.utc)
+
+    # NOTE: you said you don't care about run_id if you always TRUNCATE.
+    # Keeping it here for now because your tables still have these columns.
     run_id = f"{cfg.dataset_id}-{created_at.strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:8]}"
+
     mode = (cfg.mode or "").strip().lower()
     baseline_kind = _baseline_kind(mode)
 
@@ -430,7 +441,8 @@ def score_nf_pitches(cfg: ScoreNFConfig) -> Dict[str, int]:
 
     pitches["pitch_type"] = pitches["TaggedPitchType"].astype(str)
     pitches["baseline_id"] = pitches.apply(
-        lambda r: baseline_id_map.get((str(r["player_full_name"]), str(r["pitch_type"]))), axis=1
+        lambda r: baseline_id_map.get((str(r["player_full_name"]), str(r["pitch_type"]))),
+        axis=1,
     )
 
     skipped_no_baseline = int(pitches["baseline_id"].isna().sum())
@@ -451,7 +463,7 @@ def score_nf_pitches(cfg: ScoreNFConfig) -> Dict[str, int]:
     skipped_bad_ts = 0
 
     write_disp_first = cfg.bq_write_disposition
-    write_disp_next = "WRITE_APPEND"
+    write_disp_next = "WRITE_APPEND"  # still used within a single run for chunked loads
 
     pitches_by_file = {fn: g for fn, g in pitches.groupby("nf_file_name")}
 
@@ -495,8 +507,9 @@ def score_nf_pitches(cfg: ScoreNFConfig) -> Dict[str, int]:
 
                 sim = _score_similarity(dist_all)
 
-                f = _features_from_wave(arr)
-                fb = _features_from_wave(base)
+                # computed but not currently persisted (kept for future website tables)
+                _ = _features_from_wave(arr)
+                _ = _features_from_wave(base)
 
                 out_rows.append(
                     {

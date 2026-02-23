@@ -7,7 +7,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Iterable, List, Tuple
+from typing import Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
@@ -59,6 +59,7 @@ class BaselineBuildConfig:
 
     # Performance
     write_batch_rows: int = 200_000  # TS rows per load job
+    file_batch_size: int = 800  # how many nf files to pull TS for per BQ query
 
 
 def _parse_csv_list(v: str | None) -> Tuple[str, ...]:
@@ -107,6 +108,9 @@ def _resample_one_pitch(pitch_ts: pd.DataFrame, weight_lb: float, T: int) -> np.
     if len(pitch_ts) < 2:
         return None
 
+    if "time_s" not in pitch_ts.columns:
+        return None
+
     t = pitch_ts["time_s"].to_numpy(dtype=np.float64)
     tmin, tmax = float(np.nanmin(t)), float(np.nanmax(t))
     if not np.isfinite(tmin) or not np.isfinite(tmax) or (tmax - tmin) <= 1e-9:
@@ -116,6 +120,9 @@ def _resample_one_pitch(pitch_ts: pd.DataFrame, weight_lb: float, T: int) -> np.
     out = np.zeros((len(TS_FEATURES), T), dtype=np.float32)
 
     for j, feat in enumerate(TS_FEATURES):
+        if feat not in pitch_ts.columns:
+            return None
+
         v = pitch_ts[feat].to_numpy(dtype=np.float64)
         if np.all(~np.isfinite(v)):
             return None
@@ -155,21 +162,21 @@ def _fetch_baseline_candidates(cfg: BaselineBuildConfig) -> pd.DataFrame:
     sql = f"""
     SELECT
       dataset_id,
+      feature_version,
       player_full_name,
       TaggedPitchType AS pitch_type,
       PitchID,
       nf_file_name,
-      player_weight_lb,
-      pitch_velocity,
-      miss_distance_in,
-      {flag_col} AS is_baseline_candidate
+      SAFE_CAST(player_weight_lb AS FLOAT64) AS player_weight_lb,
+      SAFE_CAST(pitch_velocity AS FLOAT64) AS pitch_velocity,
+      SAFE_CAST(miss_distance_in AS FLOAT64) AS miss_distance_in
     FROM `{_pitch_core_fq(cfg)}`
     WHERE dataset_id = @dataset_id
+      AND feature_version = @feature_version
       AND has_trackman = TRUE
       AND has_nf_timeseries = TRUE
       AND nf_file_name IS NOT NULL
-      AND player_weight_lb IS NOT NULL
-      AND player_weight_lb > 0
+      AND SAFE_CAST(player_weight_lb AS FLOAT64) > 0
       AND TaggedPitchType IN UNNEST(@pitch_types)
       AND {flag_col} = 1
     """
@@ -177,6 +184,7 @@ def _fetch_baseline_candidates(cfg: BaselineBuildConfig) -> pd.DataFrame:
     job_config = bigquery.QueryJobConfig(
         query_parameters=[
             bigquery.ScalarQueryParameter("dataset_id", "STRING", cfg.dataset_id),
+            bigquery.ScalarQueryParameter("feature_version", "STRING", cfg.feature_version),
             bigquery.ArrayQueryParameter("pitch_types", "STRING", list(cfg.pitch_types)),
         ]
     )
@@ -184,11 +192,14 @@ def _fetch_baseline_candidates(cfg: BaselineBuildConfig) -> pd.DataFrame:
     df = client.query(sql, job_config=job_config).to_dataframe()
 
     if not df.empty:
+        # Ensure numeric
         df["pitch_velocity"] = pd.to_numeric(df["pitch_velocity"], errors="coerce")
         df["miss_distance_in"] = pd.to_numeric(df["miss_distance_in"], errors="coerce")
         df["player_weight_lb"] = pd.to_numeric(df["player_weight_lb"], errors="coerce")
+        df = df[df["player_weight_lb"].notna() & (df["player_weight_lb"] > 0)].copy()
+
         if mode == "accuracy":
-            df = df[np.isfinite(df["miss_distance_in"].to_numpy(dtype=np.float64))].copy()
+            df = df[df["miss_distance_in"].notna()].copy()
 
     return df
 
@@ -251,19 +262,27 @@ def build_nf_best_pattern_baselines(cfg: BaselineBuildConfig) -> Path:
 
     candidates = (
         candidates.groupby(["player_full_name", "pitch_type"], as_index=False)
-        .head(cfg.max_pitches_per_group)
+        .head(int(cfg.max_pitches_per_group))
         .reset_index(drop=True)
     )
 
-    file_names = candidates["nf_file_name"].dropna().unique().tolist()
+    file_names = candidates["nf_file_name"].dropna().astype(str).unique().tolist()
     console.print(f"Candidates: {len(candidates):,} rows | unique files: {len(file_names):,}")
-
-    ts = _fetch_time_series(cfg, file_names)
-    console.print(f"Fetched time series rows: {len(ts):,}")
 
     T = int(cfg.target_timesteps)
     time_s_norm = np.linspace(0.0, 1.0, T).astype(np.float32)
-    ts_by_file = {k: g for k, g in ts.groupby("file_name")}
+
+    # Fetch TS in batches to avoid giant IN lists / huge query results
+    ts_parts: List[pd.DataFrame] = []
+    for i in range(0, len(file_names), int(cfg.file_batch_size)):
+        batch = file_names[i : i + int(cfg.file_batch_size)]
+        part = _fetch_time_series(cfg, batch)
+        if not part.empty:
+            ts_parts.append(part)
+    ts = pd.concat(ts_parts, ignore_index=True) if ts_parts else pd.DataFrame()
+
+    console.print(f"Fetched time series rows: {len(ts):,}")
+    ts_by_file: Dict[str, pd.DataFrame] = {k: g for k, g in ts.groupby("file_name")} if not ts.empty else {}
 
     rows_ts: List[dict] = []
     skipped_empty = 0
@@ -271,12 +290,10 @@ def build_nf_best_pattern_baselines(cfg: BaselineBuildConfig) -> Path:
 
     # Build mean waveform per (player,pitch_type)
     for (player, pitch_type), g in candidates.groupby(["player_full_name", "pitch_type"]):
-        baseline_id = _make_baseline_id(cfg, player, pitch_type)
+        baseline_id = _make_baseline_id(cfg, str(player), str(pitch_type))
         pitch_arrays = []
-        used_pitch_ids: List[str] = []
 
         for r in g.itertuples(index=False):
-            pid = str(r.PitchID)
             fn = str(r.nf_file_name)
             w = float(r.player_weight_lb) if pd.notna(r.player_weight_lb) else 0.0
 
@@ -291,7 +308,6 @@ def build_nf_best_pattern_baselines(cfg: BaselineBuildConfig) -> Path:
                 continue
 
             pitch_arrays.append(arr)
-            used_pitch_ids.append(pid)
 
         if not pitch_arrays:
             continue
@@ -308,8 +324,8 @@ def build_nf_best_pattern_baselines(cfg: BaselineBuildConfig) -> Path:
                     "feature_version": cfg.feature_version,
                     "mode": mode,
                     "baseline_kind": baseline_kind,
-                    "player_full_name": player,
-                    "pitch_type": pitch_type,
+                    "player_full_name": str(player),
+                    "pitch_type": str(pitch_type),
                     "timestep": int(t),
                     "time_s": float(time_s_norm[t]),
                     "fx_lb": float(mean_wave[0, t]),
@@ -342,8 +358,8 @@ def build_nf_best_pattern_baselines(cfg: BaselineBuildConfig) -> Path:
         "channels": TS_FEATURES,
         "player_pitchtype_groups": int(df_ts[["player_full_name", "pitch_type"]].drop_duplicates().shape[0]),
         "players": int(df_ts["player_full_name"].nunique()),
-        "skipped_empty_ts": skipped_empty,
-        "skipped_bad_resample": skipped_bad,
+        "skipped_empty_ts": int(skipped_empty),
+        "skipped_bad_resample": int(skipped_bad),
         "output_file": str(out_path),
     }
     with open(out_dir / "_manifest.json", "w") as f:
@@ -361,7 +377,7 @@ def build_nf_best_pattern_baselines(cfg: BaselineBuildConfig) -> Path:
 
         # chunked loads in case TS is huge
         first_disp = cfg.bq_write_disposition
-        next_disp = "WRITE_APPEND"
+        next_disp = "WRITE_APPEND"  # only within this single run for chunking
 
         for i in range(0, len(df_ts), int(cfg.write_batch_rows)):
             chunk = df_ts.iloc[i : i + int(cfg.write_batch_rows)].copy()
@@ -379,6 +395,8 @@ def load_cfg_from_env(dataset_id: str, feature_version: str) -> BaselineBuildCon
     mode = (os.getenv("BASELINE_MODE", "velocity") or "velocity").strip().lower()
     T = int(os.getenv("TARGET_TIMESTEPS", "700"))
     max_p = int(os.getenv("BASELINE_MAX_PITCHES_PER_GROUP", "50"))
+    file_batch_size = int(os.getenv("NF_TS_FILE_BATCH_SIZE", "800"))
+    write_batch_rows = int(os.getenv("BQ_BASELINE_WRITE_BATCH_ROWS", "200000"))
 
     return BaselineBuildConfig(
         dataset_id=dataset_id,
@@ -398,4 +416,6 @@ def load_cfg_from_env(dataset_id: str, feature_version: str) -> BaselineBuildCon
         bq_write_disposition=(os.getenv("BQ_WRITE_DISPOSITION") or "WRITE_TRUNCATE").strip(),
         bq_baseline_table_base=(os.getenv("BQ_BASELINE_TABLE_BASE") or "baseline_model").strip(),
         local_root=local_root,
+        file_batch_size=file_batch_size,
+        write_batch_rows=write_batch_rows,
     )

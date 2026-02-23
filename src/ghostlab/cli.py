@@ -94,9 +94,6 @@ def cmd_score_nf(args: argparse.Namespace) -> int:
         overrides["mode"] = args.mode
     if args.target_timesteps is not None:
         overrides["target_timesteps"] = int(args.target_timesteps)
-    if args.days_back is not None:
-        db = int(args.days_back)
-        overrides["days_back"] = None if db <= 0 else db
 
     # ✅ only override if user provided pitch-types
     if args.pitch_types:
@@ -191,7 +188,6 @@ def build_parser() -> argparse.ArgumentParser:
     p_score.add_argument("--version", default="v1", help="Feature version (default: v1)")
     p_score.add_argument("--mode", choices=["velocity", "accuracy"], required=True, help="Scoring mode")
     p_score.add_argument("--target-timesteps", type=int, help="Resample length (default: 700)")
-    p_score.add_argument("--days-back", type=int, default=30, help="0=all time, else last N days")
     # ✅ default None so omission does NOT override config default (Fastball)
     p_score.add_argument("--pitch-types", default=None, help="CSV list (default: Fastball)")
     p_score.add_argument("--baseline-run-id", default=None, help="Override baseline run_id (else auto-pick latest)")
