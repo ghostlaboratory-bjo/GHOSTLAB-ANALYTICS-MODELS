@@ -1,4 +1,3 @@
-# src/ghostlab/pipelines/accuracy/miss_direction_model.py
 from __future__ import annotations
 
 import os
@@ -239,6 +238,8 @@ def _write_df_to_bq(cfg: MissDirectionModelConfig, df: pd.DataFrame) -> None:
 
 def train_miss_direction_model(cfg: MissDirectionModelConfig) -> Dict[str, float | int | str]:
     created_at = datetime.now(timezone.utc)
+    refresh_date_time = created_at
+
     run_id = f"{cfg.dataset_id}-{created_at.strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:8]}"
     model_version = "miss_direction_rf_v1"
 
@@ -301,6 +302,7 @@ def train_miss_direction_model(cfg: MissDirectionModelConfig) -> Dict[str, float
             "horizontal_accuracy": h_acc,
             "vertical_accuracy": v_acc,
             "created_at": created_at,
+            "refresh_date_time": refresh_date_time,
         }
     )
 

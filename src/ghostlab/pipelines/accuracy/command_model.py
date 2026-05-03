@@ -153,8 +153,7 @@ def _fetch_training_data(cfg: CommandModelConfig) -> pd.DataFrame:
         ]
     )
 
-    df = client.query(sql, job_config=job).to_dataframe()
-    return df
+    return client.query(sql, job_config=job).to_dataframe()
 
 
 def _prep_features(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Series, List[str]]:
@@ -186,12 +185,6 @@ def _prep_features(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Series, List[str]
 
 
 def _command_score_from_error(predicted_miss_in: pd.Series) -> pd.Series:
-    """
-    Coach-facing 0-100 score.
-    V1 formula:
-      100 = perfect command
-      roughly -4 points per inch of predicted miss
-    """
     score = 100.0 - (predicted_miss_in.astype(float) * 4.0)
     return score.clip(lower=0.0, upper=100.0)
 
@@ -208,6 +201,8 @@ def _write_df_to_bq(cfg: CommandModelConfig, df: pd.DataFrame) -> None:
 
 def train_command_model(cfg: CommandModelConfig) -> Dict[str, float | int | str]:
     created_at = datetime.now(timezone.utc)
+    refresh_date_time = created_at
+
     run_id = f"{cfg.dataset_id}-{created_at.strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:8]}"
     model_version = "command_rf_v1"
 
@@ -282,6 +277,7 @@ def train_command_model(cfg: CommandModelConfig) -> Dict[str, float | int | str]
             "model_mae_in": mae,
             "model_r2": r2,
             "created_at": created_at,
+            "refresh_date_time": refresh_date_time,
         }
     )
 
