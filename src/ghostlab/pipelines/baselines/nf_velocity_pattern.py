@@ -141,9 +141,15 @@ def _resample_one_pitch(
         )
         r = f(new_t).astype(np.float32)
         if feat in FORCE_FEATURES:
-            out[j, :] = r / float(weight_lb)  # weight-normalize
+            v = r / float(weight_lb)
         else:
-            out[j, :] = r - r.mean()           # mean-center path (shape, not position)
+            v = r - r.mean()           # mean-center path (remove position offset)
+
+        # Z-score normalize so all channels have unit variance before L2 comparison.
+        # Without this, path channels (inches) dominate over force channels
+        # (dimensionless) and collapse similarity scores to near-zero.
+        std = float(np.std(v))
+        out[j, :] = v / max(std, 1e-6)
 
     return out if np.isfinite(out).all() else None
 
