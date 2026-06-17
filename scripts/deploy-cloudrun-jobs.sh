@@ -158,7 +158,7 @@ gcloud run jobs deploy "${NF_ANALYSIS_VEL_JOB}" \
   --max-retries "0" --task-timeout "3600s" \
   --set-env-vars "${BASE_ENV}" \
   --command "ghostlab" \
-  --args "velocity-nf-analysis,--dataset,${DATASET},--version,${VERSION},--gcp-project,${PROJECT_ID},--bq-location,${REGION},--bq-analysis-dataset,${ANALYSIS_DATASET},--bq-src-dataset,${SRC_DATASET}"
+  --args "velocity-nf-analysis,--dataset,${DATASET},--version,${VERSION},--gcp-project,${PROJECT_ID},--bq-location,${REGION},--bq-analysis-dataset,${ANALYSIS_DATASET}"
 
 echo "================================================"
 echo "All jobs deployed. Nightly execution order:"
