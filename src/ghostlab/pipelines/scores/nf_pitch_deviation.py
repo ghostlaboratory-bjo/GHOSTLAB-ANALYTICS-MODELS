@@ -150,7 +150,9 @@ def _resample_one_pitch(pitch_ts: pd.DataFrame, weight_lb: float, T: int) -> Opt
         if feat in FORCE_FEATURES:
             out[j, :] = r / float(weight_lb)
         else:
-            out[j, :] = r
+            # Mean-center path channels so comparison captures movement shape,
+            # not absolute plate position (which shifts between sessions).
+            out[j, :] = r - r.mean()
 
     if not np.isfinite(out).all():
         return None
@@ -189,20 +191,27 @@ def _pick_latest_baseline_run_id(cfg: ScoreNFConfig) -> str:
 
 def _fetch_baseline_meta(cfg: ScoreNFConfig, baseline_run_id: str) -> pd.DataFrame:
     """
-    Meta is derived from the baseline table itself (distinct baseline_id / pitch_type / player).
+    Meta is derived from the baseline table itself (one row per baseline_id).
+    Includes release point stats (scalars repeated across all waveform rows).
     """
     client = bq_client(BQConfig(project=cfg.gcp_project, location=cfg.bq_location))
     mode = (cfg.mode or "").strip().lower()
     kind = _baseline_kind(mode)
 
     sql = f"""
-    SELECT DISTINCT
+    SELECT
       baseline_id,
-      player_full_name,
-      pitch_type,
-      n_pitches_used,
-      run_id,
-      created_at
+      ANY_VALUE(player_full_name) AS player_full_name,
+      ANY_VALUE(pitch_type)       AS pitch_type,
+      MAX(n_pitches_used)         AS n_pitches_used,
+      ANY_VALUE(run_id)           AS run_id,
+      MAX(created_at)             AS created_at,
+      MAX(mean_rel_height)        AS mean_rel_height,
+      MAX(mean_rel_side)          AS mean_rel_side,
+      MAX(mean_extension)         AS mean_extension,
+      MAX(stddev_rel_height)      AS stddev_rel_height,
+      MAX(stddev_rel_side)        AS stddev_rel_side,
+      MAX(stddev_extension)       AS stddev_extension
     FROM `{_baseline_fq(cfg)}`
     WHERE dataset_id = @dataset_id
       AND feature_version = @feature_version
@@ -210,7 +219,10 @@ def _fetch_baseline_meta(cfg: ScoreNFConfig, baseline_run_id: str) -> pd.DataFra
       AND baseline_kind = @baseline_kind
       AND run_id = @run_id
       AND pitch_type IN UNNEST(@pitch_types)
+    GROUP BY baseline_id
     """
+    # Include "ALL" so cross-pitch-type accuracy baselines (pitch_type="ALL") are found
+    pitch_types_param = list(cfg.pitch_types) + ["ALL"]
     job = bigquery.QueryJobConfig(
         query_parameters=[
             bigquery.ScalarQueryParameter("dataset_id", "STRING", cfg.dataset_id),
@@ -218,7 +230,7 @@ def _fetch_baseline_meta(cfg: ScoreNFConfig, baseline_run_id: str) -> pd.DataFra
             bigquery.ScalarQueryParameter("mode", "STRING", mode),
             bigquery.ScalarQueryParameter("baseline_kind", "STRING", kind),
             bigquery.ScalarQueryParameter("run_id", "STRING", baseline_run_id),
-            bigquery.ArrayQueryParameter("pitch_types", "STRING", list(cfg.pitch_types)),
+            bigquery.ArrayQueryParameter("pitch_types", "STRING", pitch_types_param),
         ]
     )
     return client.query(sql, job_config=job).to_dataframe()
@@ -395,6 +407,41 @@ def _score_similarity(dist_all: float) -> float:
     return float(100.0 * math.exp(-dist_all / 2.0))
 
 
+_RELEASE_STD_FLOOR = 0.025  # ~0.3 inches, prevents division by near-zero std
+
+
+def _score_release(
+    pitch_rh: Optional[float],
+    pitch_rs: Optional[float],
+    pitch_ext: Optional[float],
+    stats: dict,
+) -> Tuple[float, float, float, float]:
+    """
+    Returns (release_dist, ext_dev, release_similarity, extension_similarity).
+    All similarity scores in [0, 100]. Returns zeros if stats or pitch values are missing.
+    """
+    mean_rh = stats.get("mean_rel_height")
+    mean_rs = stats.get("mean_rel_side")
+    mean_ext = stats.get("mean_extension")
+
+    if any(v is None for v in [mean_rh, mean_rs, mean_ext, pitch_rh, pitch_rs, pitch_ext]):
+        return 0.0, 0.0, 0.0, 0.0
+
+    std_rh = max(float(stats.get("stddev_rel_height") or 0.0), _RELEASE_STD_FLOOR)
+    std_rs = max(float(stats.get("stddev_rel_side") or 0.0), _RELEASE_STD_FLOOR)
+    std_ext = max(float(stats.get("stddev_extension") or 0.0), _RELEASE_STD_FLOOR)
+
+    rh_dev = abs(float(pitch_rh) - float(mean_rh)) / std_rh
+    rs_dev = abs(float(pitch_rs) - float(mean_rs)) / std_rs
+    ext_dev = abs(float(pitch_ext) - float(mean_ext)) / std_ext
+
+    release_dist = math.sqrt(rh_dev ** 2 + rs_dev ** 2)
+    release_similarity = 100.0 * math.exp(-release_dist / 2.0)
+    extension_similarity = 100.0 * math.exp(-ext_dev / 2.0)
+
+    return release_dist, ext_dev, release_similarity, extension_similarity
+
+
 def _write_df_to_bq(cfg: ScoreNFConfig, df: pd.DataFrame, table_fq: str, disposition: str) -> None:
     client = bq_client(BQConfig(project=cfg.gcp_project, location=cfg.bq_location))
     job = client.load_table_from_dataframe(
@@ -429,6 +476,23 @@ def score_nf_pitches(cfg: ScoreNFConfig) -> Dict[str, int]:
         (str(r["player_full_name"]), str(r["pitch_type"])): str(r["baseline_id"]) for _, r in meta.iterrows()
     }
 
+    # Release stats keyed by baseline_id — used for per-pitch release deviation scoring
+    release_stats_map: Dict[str, dict] = {
+        str(r["baseline_id"]): {
+            "mean_rel_height": r.get("mean_rel_height"),
+            "mean_rel_side": r.get("mean_rel_side"),
+            "mean_extension": r.get("mean_extension"),
+            "stddev_rel_height": r.get("stddev_rel_height"),
+            "stddev_rel_side": r.get("stddev_rel_side"),
+            "stddev_extension": r.get("stddev_extension"),
+        }
+        for _, r in meta.iterrows()
+    }
+
+    def _lookup_baseline_id(player: str, pitch_type: str) -> Optional[str]:
+        # Exact match (velocity mode, per pitch type) → fall back to "ALL" (accuracy mode, per player)
+        return baseline_id_map.get((player, pitch_type)) or baseline_id_map.get((player, "ALL"))
+
     bts = _fetch_baseline_ts(cfg, baseline_run_id)
     T = int(cfg.target_timesteps)
     baseline_wave = _build_baseline_waveforms(bts, T)
@@ -441,7 +505,7 @@ def score_nf_pitches(cfg: ScoreNFConfig) -> Dict[str, int]:
 
     pitches["pitch_type"] = pitches["TaggedPitchType"].astype(str)
     pitches["baseline_id"] = pitches.apply(
-        lambda r: baseline_id_map.get((str(r["player_full_name"]), str(r["pitch_type"]))),
+        lambda r: _lookup_baseline_id(str(r["player_full_name"]), str(r["pitch_type"])),
         axis=1,
     )
 
@@ -505,11 +569,26 @@ def score_nf_pitches(cfg: ScoreNFConfig) -> Dict[str, int]:
                 corr_path = float(np.mean(corr_ch[3:5]))
                 corr_all = float(np.mean(corr_ch))
 
-                sim = _score_similarity(dist_all)
+                nf_sim = _score_similarity(dist_all)
 
-                # computed but not currently persisted (kept for future website tables)
-                _ = _features_from_wave(arr)
-                _ = _features_from_wave(base)
+                # Release point + extension deviation vs pattern signature
+                def _to_float(v) -> Optional[float]:
+                    return float(v) if v is not None and pd.notna(v) else None
+
+                rel_stats = release_stats_map.get(bid, {})
+                release_dist, ext_dev, release_sim, extension_sim = _score_release(
+                    _to_float(getattr(r, "RelHeight", None)),
+                    _to_float(getattr(r, "RelSide", None)),
+                    _to_float(getattr(r, "Extension", None)),
+                    rel_stats,
+                )
+
+                has_release = rel_stats.get("mean_rel_height") is not None
+                if has_release:
+                    # 70% NF body mechanics, 20% release point, 10% extension
+                    pattern_sim = 0.70 * nf_sim + 0.20 * release_sim + 0.10 * extension_sim
+                else:
+                    pattern_sim = nf_sim
 
                 out_rows.append(
                     {
@@ -534,7 +613,12 @@ def score_nf_pitches(cfg: ScoreNFConfig) -> Dict[str, int]:
                         "corr_all": float(corr_all),
                         "corr_forces": float(corr_forces),
                         "corr_path": float(corr_path),
-                        "similarity_score": float(sim),
+                        "similarity_score": float(nf_sim),       # pure NF waveform
+                        "release_dist": float(release_dist),      # normalized release deviation
+                        "ext_dev": float(ext_dev),                # normalized extension deviation
+                        "release_similarity": float(release_sim),
+                        "extension_similarity": float(extension_sim),
+                        "pattern_similarity": float(pattern_sim), # composite score
                         "created_at": created_at,
                         "run_id": run_id,
                     }

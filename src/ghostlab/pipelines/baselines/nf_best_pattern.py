@@ -21,6 +21,7 @@ console = Console()
 
 TS_FEATURES = ["fx_lb", "fy_lb", "fz_lb", "x_in", "y_in"]
 FORCE_FEATURES = {"fx_lb", "fy_lb", "fz_lb"}
+RELEASE_FEATURES = ["RelHeight", "RelSide", "Extension"]  # Trackman scalars (feet)
 
 
 @dataclass(frozen=True)
@@ -39,6 +40,7 @@ class BaselineBuildConfig:
     # ✅ Default Fastball only (unless CLI passes --pitch-types)
     pitch_types: Tuple[str, ...] = ("Fastball",)
     max_pitches_per_group: int = 50
+    min_pitches_for_pattern: int = 5  # skip group if fewer valid NF pitches
 
     # BQ connection + sources
     gcp_project: str = ""
@@ -140,7 +142,9 @@ def _resample_one_pitch(pitch_ts: pd.DataFrame, weight_lb: float, T: int) -> np.
         if feat in FORCE_FEATURES:
             out[j, :] = r / float(weight_lb)
         else:
-            out[j, :] = r
+            # Mean-center path channels so comparison captures movement shape,
+            # not absolute plate position (which shifts between sessions).
+            out[j, :] = r - r.mean()
 
     if not np.isfinite(out).all():
         return None
@@ -169,7 +173,10 @@ def _fetch_baseline_candidates(cfg: BaselineBuildConfig) -> pd.DataFrame:
       nf_file_name,
       SAFE_CAST(player_weight_lb AS FLOAT64) AS player_weight_lb,
       SAFE_CAST(pitch_velocity AS FLOAT64) AS pitch_velocity,
-      SAFE_CAST(miss_distance_in AS FLOAT64) AS miss_distance_in
+      SAFE_CAST(miss_distance_in AS FLOAT64) AS miss_distance_in,
+      SAFE_CAST(RelHeight AS FLOAT64) AS RelHeight,
+      SAFE_CAST(RelSide AS FLOAT64) AS RelSide,
+      SAFE_CAST(Extension AS FLOAT64) AS Extension
     FROM `{_pitch_core_fq(cfg)}`
     WHERE dataset_id = @dataset_id
       AND feature_version = @feature_version
@@ -232,6 +239,15 @@ def _write_df_to_bq(cfg: BaselineBuildConfig, df: pd.DataFrame, table_fq: str, d
     job.result()
 
 
+def _nan_mean_std(values: list) -> tuple:
+    arr = np.array([v for v in values if v is not None and np.isfinite(float(v))], dtype=np.float64)
+    if arr.size == 0:
+        return None, None
+    mean = float(arr.mean())
+    std = float(arr.std()) if arr.size > 1 else 0.0
+    return mean, std
+
+
 def build_nf_best_pattern_baselines(cfg: BaselineBuildConfig) -> Path:
     out_dir = _dest_dir(cfg)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -287,11 +303,28 @@ def build_nf_best_pattern_baselines(cfg: BaselineBuildConfig) -> Path:
     rows_ts: List[dict] = []
     skipped_empty = 0
     skipped_bad = 0
+    skipped_min_pitches = 0
 
-    # Build mean waveform per (player,pitch_type)
-    for (player, pitch_type), g in candidates.groupby(["player_full_name", "pitch_type"]):
+    # Accuracy: one pattern per player across ALL pitch types — delivery mechanics are the same.
+    # Velocity (deferred): keep per-pitch-type grouping.
+    if mode == "accuracy":
+        group_keys = ["player_full_name"]
+        pitch_type_label = "ALL"
+    else:
+        group_keys = ["player_full_name", "pitch_type"]
+        pitch_type_label = None  # set from group key below
+
+    # Build mean waveform per group
+    for group_key, g in candidates.groupby(group_keys):
+        if mode == "accuracy":
+            # pandas may return a scalar or a 1-tuple depending on version
+            player = group_key[0] if isinstance(group_key, tuple) else str(group_key)
+            pitch_type = pitch_type_label
+        else:
+            player, pitch_type = group_key
         baseline_id = _make_baseline_id(cfg, str(player), str(pitch_type))
         pitch_arrays = []
+        valid_releases: List[dict] = []
 
         for r in g.itertuples(index=False):
             fn = str(r.nf_file_name)
@@ -308,13 +341,28 @@ def build_nf_best_pattern_baselines(cfg: BaselineBuildConfig) -> Path:
                 continue
 
             pitch_arrays.append(arr)
+            valid_releases.append({
+                "RelHeight": getattr(r, "RelHeight", None),
+                "RelSide": getattr(r, "RelSide", None),
+                "Extension": getattr(r, "Extension", None),
+            })
 
-        if not pitch_arrays:
+        if len(pitch_arrays) < cfg.min_pitches_for_pattern:
+            console.print(
+                f"[yellow]  Skip {player}/{pitch_type}: {len(pitch_arrays)} pitches "
+                f"< min={cfg.min_pitches_for_pattern}[/yellow]"
+            )
+            skipped_min_pitches += 1
             continue
 
-        stack = np.stack(pitch_arrays, axis=0)  # (n,c,t)
-        mean_wave = stack.mean(axis=0)  # (c,t)
+        stack = np.stack(pitch_arrays, axis=0)  # (n, c, t)
+        mean_wave = stack.mean(axis=0)          # (c, t)
         n_used = int(stack.shape[0])
+
+        # Release point stats (scalars, same value repeated on all timestep rows)
+        mean_rh, std_rh = _nan_mean_std([r.get("RelHeight") for r in valid_releases])
+        mean_rs, std_rs = _nan_mean_std([r.get("RelSide") for r in valid_releases])
+        mean_ext, std_ext = _nan_mean_std([r.get("Extension") for r in valid_releases])
 
         for t in range(T):
             rows_ts.append(
@@ -334,6 +382,13 @@ def build_nf_best_pattern_baselines(cfg: BaselineBuildConfig) -> Path:
                     "x_in": float(mean_wave[3, t]),
                     "y_in": float(mean_wave[4, t]),
                     "n_pitches_used": n_used,
+                    # Release point signature for this player/pitch_type pattern
+                    "mean_rel_height": mean_rh,
+                    "mean_rel_side": mean_rs,
+                    "mean_extension": mean_ext,
+                    "stddev_rel_height": std_rh,
+                    "stddev_rel_side": std_rs,
+                    "stddev_extension": std_ext,
                     "created_at": created_at,
                     "run_id": run_id,
                 }
@@ -360,6 +415,7 @@ def build_nf_best_pattern_baselines(cfg: BaselineBuildConfig) -> Path:
         "players": int(df_ts["player_full_name"].nunique()),
         "skipped_empty_ts": int(skipped_empty),
         "skipped_bad_resample": int(skipped_bad),
+        "skipped_min_pitches": int(skipped_min_pitches),
         "output_file": str(out_path),
     }
     with open(out_dir / "_manifest.json", "w") as f:
@@ -395,6 +451,7 @@ def load_cfg_from_env(dataset_id: str, feature_version: str) -> BaselineBuildCon
     mode = (os.getenv("BASELINE_MODE", "velocity") or "velocity").strip().lower()
     T = int(os.getenv("TARGET_TIMESTEPS", "700"))
     max_p = int(os.getenv("BASELINE_MAX_PITCHES_PER_GROUP", "50"))
+    min_p = int(os.getenv("BASELINE_MIN_PITCHES_FOR_PATTERN", "5"))
     file_batch_size = int(os.getenv("NF_TS_FILE_BATCH_SIZE", "800"))
     write_batch_rows = int(os.getenv("BQ_BASELINE_WRITE_BATCH_ROWS", "200000"))
 
@@ -405,6 +462,7 @@ def load_cfg_from_env(dataset_id: str, feature_version: str) -> BaselineBuildCon
         mode=mode,
         pitch_types=tuple(pitch_types),
         max_pitches_per_group=max_p,
+        min_pitches_for_pattern=min_p,
         gcp_project=(os.getenv("GCP_PROJECT") or "").strip(),
         bq_location=(os.getenv("BQ_LOCATION") or "us-east5").strip(),
         bq_src_dataset=(os.getenv("BQ_SRC_DATASET") or dataset_id).strip(),

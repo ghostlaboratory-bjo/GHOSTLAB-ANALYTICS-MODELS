@@ -1,0 +1,600 @@
+# alpha_baseball_etl_workflow.yaml
+# Execution order:
+#   FTP → Drive → GCS → Bronze/Silver/Gold SPs → PitchCore
+#   → [A] NF Accuracy Baseline (Cloud Run)
+#   → [B] Command Model + Miss Direction (Cloud Run, sequential)
+#   → [C] NF Accuracy Scores (Cloud Run — needs baseline from A)
+#   → [D] Intel Build (Cloud Run — needs command+miss from B)
+#   → [E] NF Velocity Baseline (Cloud Run — FB+SI top 10% max-effort pattern)
+#   → [F] NF Velocity Scores (Cloud Run — needs velocity baseline from E)
+#   → [G] Velocity Intel Build (Cloud Run — session trend + coaching summary)
+#   → [H] Velocity NF Analysis (Cloud Run — per-player NF feature × velocity correlations)
+#   → BQ summary/website SPs
+
+main:
+  params: [input]
+  steps:
+
+    - init:
+        assign:
+          - projectId: ${default(map.get(input, "projectId"), "ghost-pitching-470315")}
+          - region: ${default(map.get(input, "region"), "us-east5")}
+          - dataset: ${default(map.get(input, "dataset"), "alpha_bsbl")}
+          - bqLocation: ${default(map.get(input, "bqLocation"), "us-east5")}
+          - featureVersion: ${default(map.get(input, "featureVersion"), "v1")}
+          - patternMode: ${default(map.get(input, "patternMode"), "accuracy")}
+          - pollIntervalMinutes: ${default(map.get(input, "pollIntervalMinutes"), 15)}
+
+          - ftpJob: "ftp-to-silver-alpha-bsbl"
+          - gdJob: "drive-to-gcp-alphabsb"
+          - gcsJob: "gcs-to-bq-alphabsb"
+          - commandModelJob: "accuracy-command-model-alpha-bsbl"
+          - missDirectionJob: "accuracy-miss-direction-alpha-bsbl"
+          - nfBaselineAccJob: "nf-baseline-accuracy-alpha-bsbl"
+          - nfScoreAccJob: "nf-score-accuracy-alpha-bsbl"
+          - intelBuildJob: "coach-intel-build-alpha-bsbl"
+          - nfBaselineVelJob: "nf-baseline-velocity-alpha-bsbl"
+          - nfScoreVelJob: "nf-score-velocity-alpha-bsbl"
+          - nfIntelVelJob: "nf-intel-velocity-alpha-bsbl"
+          - nfNfAnalysisVelJob: "nf-nf-analysis-velocity-alpha-bsbl"
+
+          - maxFtpMinutes: 240
+          - maxDriveMinutes: 240
+          - maxGcsMinutes: 180
+          - maxCommandModelMinutes: 180
+          - maxMissDirectionMinutes: 180
+          - maxBaselineAccMinutes: 120
+          - maxScoreAccMinutes: 120
+          - maxIntelBuildMinutes: 30
+          - maxBaselineVelMinutes: 120
+          - maxScoreVelMinutes: 120
+          - maxIntelVelMinutes: 30
+          - maxNfAnalysisVelMinutes: 60
+
+          - v2Base: https://run.googleapis.com/v2/
+          - projectsPrefix: projects/
+          - locationsMid: /locations/
+          - jobsMid: /jobs/
+          - runSuffix: :run
+          - bt: "`"
+
+    - runFtp:
+        call: run_job_v2
+        args:
+          projectId: ${projectId}
+          region: ${region}
+          jobName: ${ftpJob}
+          v2Base: ${v2Base}
+          projectsPrefix: ${projectsPrefix}
+          locationsMid: ${locationsMid}
+          jobsMid: ${jobsMid}
+          runSuffix: ${runSuffix}
+        result: ftpOp
+
+    - pollFtp:
+        call: poll_operation_v2
+        args:
+          operationName: ${ftpOp}
+          intervalMinutes: ${pollIntervalMinutes}
+          maxMinutes: ${maxFtpMinutes}
+          v2Base: ${v2Base}
+
+    - runDrive:
+        call: run_job_v2
+        args:
+          projectId: ${projectId}
+          region: ${region}
+          jobName: ${gdJob}
+          v2Base: ${v2Base}
+          projectsPrefix: ${projectsPrefix}
+          locationsMid: ${locationsMid}
+          jobsMid: ${jobsMid}
+          runSuffix: ${runSuffix}
+        result: driveOp
+
+    - pollDrive:
+        call: poll_operation_v2
+        args:
+          operationName: ${driveOp}
+          intervalMinutes: ${pollIntervalMinutes}
+          maxMinutes: ${maxDriveMinutes}
+          v2Base: ${v2Base}
+
+    - runGcs:
+        call: run_job_v2
+        args:
+          projectId: ${projectId}
+          region: ${region}
+          jobName: ${gcsJob}
+          v2Base: ${v2Base}
+          projectsPrefix: ${projectsPrefix}
+          locationsMid: ${locationsMid}
+          jobsMid: ${jobsMid}
+          runSuffix: ${runSuffix}
+        result: gcsOp
+
+    - pollGcs:
+        call: poll_operation_v2
+        args:
+          operationName: ${gcsOp}
+          intervalMinutes: ${pollIntervalMinutes}
+          maxMinutes: ${maxGcsMinutes}
+          v2Base: ${v2Base}
+
+    # ---------------- ALPHA_BSBL BASE ETL ----------------
+
+    - callSpLoadBronzeTrackmanSummary:
+        call: googleapis.bigquery.v2.jobs.query
+        args:
+          projectId: ${projectId}
+          body:
+            query: ${"CALL " + bt + projectId + "." + dataset + ".sp_load_bronze_trackman_summary" + bt + "()"}
+            useLegacySql: false
+            location: ${bqLocation}
+
+    - callSpBuildSilverTrackmanSummary:
+        call: googleapis.bigquery.v2.jobs.query
+        args:
+          projectId: ${projectId}
+          body:
+            query: ${"CALL " + bt + projectId + "." + dataset + ".sp_build_silver_trackman_summary" + bt + "()"}
+            useLegacySql: false
+            location: ${bqLocation}
+
+    - callSpBuildSilverNewtforceSummary:
+        call: googleapis.bigquery.v2.jobs.query
+        args:
+          projectId: ${projectId}
+          body:
+            query: ${"CALL " + bt + projectId + "." + dataset + ".sp_build_silver_newtforce_summary" + bt + "()"}
+            useLegacySql: false
+            location: ${bqLocation}
+
+    - callSpLoadGoldTrackmanPitchpaths:
+        call: googleapis.bigquery.v2.jobs.query
+        args:
+          projectId: ${projectId}
+          body:
+            query: ${"CALL " + bt + projectId + "." + dataset + ".sp_load_gold_trackman_pitchpaths" + bt + "()"}
+            useLegacySql: false
+            location: ${bqLocation}
+
+    - callSpGoldSummary:
+        call: googleapis.bigquery.v2.jobs.query
+        args:
+          projectId: ${projectId}
+          body:
+            query: ${"CALL " + bt + projectId + "." + dataset + ".sp_build_gold_pitching_summary" + bt + "()"}
+            useLegacySql: false
+            location: ${bqLocation}
+
+    - callSpGoldNF:
+        call: googleapis.bigquery.v2.jobs.query
+        args:
+          projectId: ${projectId}
+          body:
+            query: ${"CALL " + bt + projectId + "." + dataset + ".sp_build_gold_newtforce_time_series" + bt + "()"}
+            useLegacySql: false
+            location: ${bqLocation}
+
+    # ---------------- ANALYSIS + MODELS ----------------
+
+    - callPitchCore:
+        call: googleapis.bigquery.v2.jobs.query
+        args:
+          projectId: ${projectId}
+          body:
+            query: ${"CALL " + bt + projectId + ".analysis_model.sp_refresh_pitch_core_v1" + bt + "('" + projectId + "', '" + dataset + "', '" + dataset + "', '" + featureVersion + "', '" + projectId + "', 'analysis_model', 'pitch_core_v1')"}
+            useLegacySql: false
+            location: ${bqLocation}
+
+    # [A] NF Accuracy Baseline — reads pitch_core_v1 + gold_newtforce_time_series
+    - runBaselineAccuracy:
+        call: run_job_v2
+        args:
+          projectId: ${projectId}
+          region: ${region}
+          jobName: ${nfBaselineAccJob}
+          v2Base: ${v2Base}
+          projectsPrefix: ${projectsPrefix}
+          locationsMid: ${locationsMid}
+          jobsMid: ${jobsMid}
+          runSuffix: ${runSuffix}
+        result: baselineAccOp
+
+    - pollBaselineAccuracy:
+        call: poll_operation_v2
+        args:
+          operationName: ${baselineAccOp}
+          intervalMinutes: ${pollIntervalMinutes}
+          maxMinutes: ${maxBaselineAccMinutes}
+          v2Base: ${v2Base}
+
+    # [B] Command Model + Miss Direction (sequential, no dependency on baseline)
+    - runCommandModel:
+        call: run_job_v2
+        args:
+          projectId: ${projectId}
+          region: ${region}
+          jobName: ${commandModelJob}
+          v2Base: ${v2Base}
+          projectsPrefix: ${projectsPrefix}
+          locationsMid: ${locationsMid}
+          jobsMid: ${jobsMid}
+          runSuffix: ${runSuffix}
+        result: cmdOp
+
+    - pollCommandModel:
+        call: poll_operation_v2
+        args:
+          operationName: ${cmdOp}
+          intervalMinutes: ${pollIntervalMinutes}
+          maxMinutes: ${maxCommandModelMinutes}
+          v2Base: ${v2Base}
+
+    - runMissDirection:
+        call: run_job_v2
+        args:
+          projectId: ${projectId}
+          region: ${region}
+          jobName: ${missDirectionJob}
+          v2Base: ${v2Base}
+          projectsPrefix: ${projectsPrefix}
+          locationsMid: ${locationsMid}
+          jobsMid: ${jobsMid}
+          runSuffix: ${runSuffix}
+        result: missOp
+
+    - pollMissDirection:
+        call: poll_operation_v2
+        args:
+          operationName: ${missOp}
+          intervalMinutes: ${pollIntervalMinutes}
+          maxMinutes: ${maxMissDirectionMinutes}
+          v2Base: ${v2Base}
+
+    # [C] NF Accuracy Scores — needs baseline from [A]; command/miss done by now
+    - runScoreAccuracy:
+        call: run_job_v2
+        args:
+          projectId: ${projectId}
+          region: ${region}
+          jobName: ${nfScoreAccJob}
+          v2Base: ${v2Base}
+          projectsPrefix: ${projectsPrefix}
+          locationsMid: ${locationsMid}
+          jobsMid: ${jobsMid}
+          runSuffix: ${runSuffix}
+        result: scoreAccOp
+
+    - pollScoreAccuracy:
+        call: poll_operation_v2
+        args:
+          operationName: ${scoreAccOp}
+          intervalMinutes: ${pollIntervalMinutes}
+          maxMinutes: ${maxScoreAccMinutes}
+          v2Base: ${v2Base}
+
+    # [D] Intel Build — reads command scores + miss direction → writes model_pitch_intelligence_v1
+    #     Must run before the BQ summary SPs that read from those tables.
+    - runIntelBuild:
+        call: run_job_v2
+        args:
+          projectId: ${projectId}
+          region: ${region}
+          jobName: ${intelBuildJob}
+          v2Base: ${v2Base}
+          projectsPrefix: ${projectsPrefix}
+          locationsMid: ${locationsMid}
+          jobsMid: ${jobsMid}
+          runSuffix: ${runSuffix}
+        result: intelOp
+
+    - pollIntelBuild:
+        call: poll_operation_v2
+        args:
+          operationName: ${intelOp}
+          intervalMinutes: ${pollIntervalMinutes}
+          maxMinutes: ${maxIntelBuildMinutes}
+          v2Base: ${v2Base}
+
+    # [E] NF Velocity Baseline — pools ALL FB+SI per player, takes top 10% by velocity
+    #     Reads pitch_core_v1 + gold_newtforce_time_series → writes baseline_model_velocity
+    - runBaselineVelocity:
+        call: run_job_v2
+        args:
+          projectId: ${projectId}
+          region: ${region}
+          jobName: ${nfBaselineVelJob}
+          v2Base: ${v2Base}
+          projectsPrefix: ${projectsPrefix}
+          locationsMid: ${locationsMid}
+          jobsMid: ${jobsMid}
+          runSuffix: ${runSuffix}
+        result: baselineVelOp
+
+    - pollBaselineVelocity:
+        call: poll_operation_v2
+        args:
+          operationName: ${baselineVelOp}
+          intervalMinutes: ${pollIntervalMinutes}
+          maxMinutes: ${maxBaselineVelMinutes}
+          v2Base: ${v2Base}
+
+    # [F] NF Velocity Scores — scores all FB+SI pitches vs each player's max-effort pattern
+    #     → writes scores_model_velocity with pitch_velocity + velocity_vs_baseline columns
+    - runScoreVelocity:
+        call: run_job_v2
+        args:
+          projectId: ${projectId}
+          region: ${region}
+          jobName: ${nfScoreVelJob}
+          v2Base: ${v2Base}
+          projectsPrefix: ${projectsPrefix}
+          locationsMid: ${locationsMid}
+          jobsMid: ${jobsMid}
+          runSuffix: ${runSuffix}
+        result: scoreVelOp
+
+    - pollScoreVelocity:
+        call: poll_operation_v2
+        args:
+          operationName: ${scoreVelOp}
+          intervalMinutes: ${pollIntervalMinutes}
+          maxMinutes: ${maxScoreVelMinutes}
+          v2Base: ${v2Base}
+
+    # [G] Velocity Intel Build — aggregates scores_model_velocity into:
+    #     velocity_session_trend_v1  (per player/session trend)
+    #     velocity_coaching_summary_v1  (lifetime coaching insight per player)
+    - runIntelVelocity:
+        call: run_job_v2
+        args:
+          projectId: ${projectId}
+          region: ${region}
+          jobName: ${nfIntelVelJob}
+          v2Base: ${v2Base}
+          projectsPrefix: ${projectsPrefix}
+          locationsMid: ${locationsMid}
+          jobsMid: ${jobsMid}
+          runSuffix: ${runSuffix}
+        result: intelVelOp
+
+    - pollIntelVelocity:
+        call: poll_operation_v2
+        args:
+          operationName: ${intelVelOp}
+          intervalMinutes: ${pollIntervalMinutes}
+          maxMinutes: ${maxIntelVelMinutes}
+          v2Base: ${v2Base}
+
+    # [H] Velocity NF Analysis — joins scores_model_velocity → gold_newtforce_time_series
+    #     Computes per-pitch NF features, runs per-player Pearson correlations vs velocity
+    #     → writes velocity_nf_analysis_v1
+    - runNfAnalysisVelocity:
+        call: run_job_v2
+        args:
+          projectId: ${projectId}
+          region: ${region}
+          jobName: ${nfNfAnalysisVelJob}
+          v2Base: ${v2Base}
+          projectsPrefix: ${projectsPrefix}
+          locationsMid: ${locationsMid}
+          jobsMid: ${jobsMid}
+          runSuffix: ${runSuffix}
+        result: nfAnalysisVelOp
+
+    - pollNfAnalysisVelocity:
+        call: poll_operation_v2
+        args:
+          operationName: ${nfAnalysisVelOp}
+          intervalMinutes: ${pollIntervalMinutes}
+          maxMinutes: ${maxNfAnalysisVelMinutes}
+          v2Base: ${v2Base}
+
+    # ---------------- BQ SUMMARY / WEBSITE SPs ----------------
+    # These read from tables written by intel-build, score-nf, command, and miss.
+
+    - callPitchIntelligenceSummary:
+        call: googleapis.bigquery.v2.jobs.query
+        args:
+          projectId: ${projectId}
+          body:
+            query: ${"CALL " + bt + projectId + ".analysis_model.sp_refresh_pitch_intelligence_summary_v1" + bt + "('" + projectId + "', 'analysis_model')"}
+            useLegacySql: false
+            location: ${bqLocation}
+
+    - callPitchIntelligence:
+        call: googleapis.bigquery.v2.jobs.query
+        args:
+          projectId: ${projectId}
+          body:
+            query: ${"CALL " + bt + projectId + ".analysis_model.sp_refresh_pitch_intelligence_v1" + bt + "('" + dataset + "', '" + featureVersion + "')"}
+            useLegacySql: false
+            location: ${bqLocation}
+
+    - callPitchMechanics:
+        call: googleapis.bigquery.v2.jobs.query
+        args:
+          projectId: ${projectId}
+          body:
+            query: ${"CALL " + bt + projectId + ".analysis_model.sp_refresh_pitch_mechanics_v1" + bt + "('" + projectId + "', '" + dataset + "', '" + projectId + "', 'analysis_model', '" + featureVersion + "')"}
+            useLegacySql: false
+            location: ${bqLocation}
+
+    - callMechanicsDetail:
+        call: googleapis.bigquery.v2.jobs.query
+        args:
+          projectId: ${projectId}
+          body:
+            query: ${"CALL " + bt + projectId + ".analysis_model.sp_build_mechanics_detail_v1" + bt + "('" + dataset + "', '" + featureVersion + "')"}
+            useLegacySql: false
+            location: ${bqLocation}
+
+    - callMechanicsSummary:
+        call: googleapis.bigquery.v2.jobs.query
+        args:
+          projectId: ${projectId}
+          body:
+            query: ${"CALL " + bt + projectId + ".analysis_model.sp_build_mechanics_summary_v1" + bt + "('" + dataset + "', '" + featureVersion + "')"}
+            useLegacySql: false
+            location: ${bqLocation}
+
+    - callBestPatternSummary:
+        call: googleapis.bigquery.v2.jobs.query
+        args:
+          projectId: ${projectId}
+          body:
+            query: ${"CALL " + bt + projectId + ".analysis_model.sp_build_best_pattern_summary_v1" + bt + "('" + dataset + "', '" + featureVersion + "', '" + patternMode + "')"}
+            useLegacySql: false
+            location: ${bqLocation}
+
+    - callPitchSummary:
+        call: googleapis.bigquery.v2.jobs.query
+        args:
+          projectId: ${projectId}
+          body:
+            query: ${"CALL " + bt + projectId + ".analysis_model.sp_build_pitch_summary_v1" + bt + "('" + dataset + "', '" + featureVersion + "')"}
+            useLegacySql: false
+            location: ${bqLocation}
+
+    - callCoachSummary:
+        call: googleapis.bigquery.v2.jobs.query
+        args:
+          projectId: ${projectId}
+          body:
+            query: ${"CALL " + bt + projectId + ".analysis_model.sp_build_coach_intelligence_summary_v1" + bt + "('" + dataset + "', '" + featureVersion + "')"}
+            useLegacySql: false
+            location: ${bqLocation}
+
+    - callSessionTrend:
+        call: googleapis.bigquery.v2.jobs.query
+        args:
+          projectId: ${projectId}
+          body:
+            query: ${"CALL " + bt + projectId + ".analysis_model.sp_build_session_trend_v1" + bt + "('" + dataset + "', '" + featureVersion + "')"}
+            useLegacySql: false
+            location: ${bqLocation}
+
+    - callWebsiteTables:
+        call: googleapis.bigquery.v2.jobs.query
+        args:
+          projectId: ${projectId}
+          body:
+            query: ${"CALL " + bt + projectId + ".analysis_model.sp_refresh_website_tables_v1" + bt + "('" + dataset + "', '" + featureVersion + "', '" + projectId + "', 'analysis_model', 'website_pitch_level_v1', 'website_session_summary_v1')"}
+            useLegacySql: false
+            location: ${bqLocation}
+
+    - done:
+        return: ${"Workflow Complete for dataset=" + dataset + " project=" + projectId}
+
+
+run_job_v2:
+  params: [projectId, region, jobName, v2Base, projectsPrefix, locationsMid, jobsMid, runSuffix]
+  steps:
+    - build:
+        assign:
+          - jobFullName: ${projectsPrefix + projectId + locationsMid + region + jobsMid + jobName}
+          - url: ${v2Base + jobFullName + runSuffix}
+
+    - callRun:
+        call: http.post
+        args:
+          url: ${url}
+          auth:
+            type: OAuth2
+          headers:
+            Content-Type: application/json
+          body: {}
+        result: resp
+
+    - returnOpName:
+        return: ${resp.body.name}
+
+
+poll_operation_v2:
+  params: [operationName, intervalMinutes, maxMinutes, v2Base]
+  steps:
+    - init:
+        assign:
+          - intervalSeconds: ${intervalMinutes * 60}
+          - maxSeconds: ${maxMinutes * 60}
+          - elapsedSeconds: 0
+          - url: ${v2Base + operationName}
+
+    - getOp:
+        call: http.get
+        args:
+          url: ${url}
+          auth:
+            type: OAuth2
+        result: opResp
+
+    - normalize:
+        assign:
+          - body: ${opResp.body}
+          - doneFlag: ${default(map.get(body, "done"), false)}
+          - execObj: ${map.get(body, "response")}
+          - execName: ""
+          - completionTime: null
+          - failedCount: 0
+          - succeededCount: 0
+          - taskCount: 0
+
+    - fillIfDone:
+        switch:
+          - condition: ${doneFlag}
+            next: setFromExec
+        next: logProgress
+
+    - setFromExec:
+        assign:
+          - execName: ${default(map.get(execObj, "name"), "")}
+          - completionTime: ${map.get(execObj, "completionTime")}
+          - failedCount: ${default(map.get(execObj, "failedCount"), 0)}
+          - succeededCount: ${default(map.get(execObj, "succeededCount"), 0)}
+          - taskCount: ${default(map.get(execObj, "taskCount"), 0)}
+        next: logProgress
+
+    - logProgress:
+        call: sys.log
+        args:
+          severity: "INFO"
+          text: ${"pollOp " + operationName + " elapsedMin=" + string(elapsedSeconds / 60) + " done=" + string(doneFlag) + " exec=" + string(execName) + " succeeded=" + string(succeededCount) + "/" + string(taskCount) + " failed=" + string(failedCount) + " completionTime=" + string(completionTime)}
+
+    - decideDone:
+        switch:
+          - condition: ${doneFlag}
+            next: doneByCounts
+        next: notDoneYet
+
+    - doneByCounts:
+        switch:
+          - condition: ${failedCount != 0}
+            next: fail
+        next: success
+
+    - success:
+        return: ${execName}
+
+    - fail:
+        raise: ${"Cloud Run job failed. op=" + operationName + " exec=" + execName + " failedCount=" + string(failedCount)}
+
+    - notDoneYet:
+        switch:
+          - condition: ${elapsedSeconds < maxSeconds}
+            next: sleep
+        next: timeout
+
+    - sleep:
+        call: sys.sleep
+        args:
+          seconds: ${intervalSeconds}
+
+    - bump:
+        assign:
+          - elapsedSeconds: ${elapsedSeconds + intervalSeconds}
+        next: getOp
+
+    - timeout:
+        raise: ${"Timeout waiting for operation " + operationName + " maxMinutes=" + string(maxMinutes)}
