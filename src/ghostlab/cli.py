@@ -492,7 +492,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_vintel.set_defaults(func=cmd_velocity_intel)
 
     # ---------------- velocity-baseline ----------------
-    p_vbase = sub.add_parser("velocity-baseline", help="Build velocity max-effort NF baselines (FB+SI top 10%)")
+    p_vbase = sub.add_parser("velocity-baseline", help="Build velocity max-effort NF baselines (FB+SI top 10%%)")
     p_vbase.add_argument("--dataset",           required=True)
     p_vbase.add_argument("--version",           default="v1")
     p_vbase.add_argument("--top-velocity-pct",  type=float, default=None,

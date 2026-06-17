@@ -12,8 +12,9 @@ baseline meta (baseline_model_velocity) and produces two pre-aggregated tables:
   Step 2 → velocity_coaching_summary_v1
     One row per player (lifetime summary).
     The key coaching insight: avg velocity when mechanics match the max-effort
-    pattern (sim >= 75%) vs when they drift (sim < 60%), with the computed
-    velocity gap and a human-readable coaching_insight text field.
+    pattern (top 25% of that player's own pattern-similarity pitches) vs when
+    they drift (bottom 25%), with the computed velocity gap and a human-readable
+    coaching_insight text field.
 """
 from __future__ import annotations
 
@@ -200,19 +201,43 @@ def _build_coaching_summary(cfg: VelocityIntelConfig, client: bigquery.Client) -
         ROUND(AVG(pitch_velocity),        1)  AS avg_velocity,
         ROUND(AVG(pattern_similarity),    1)  AS avg_pattern_similarity,
         ROUND(AVG(velocity_vs_baseline),  2)  AS avg_velocity_vs_baseline,
-        ROUND(MAX(pitch_velocity),        1)  AS peak_velocity,
-        -- velocity when mechanics are on (sim >= 75)
-        ROUND(AVG(IF(pattern_similarity >= 75, pitch_velocity, NULL)), 1) AS avg_velo_when_sim_high,
-        -- velocity when mechanics drift (sim < 60)
-        ROUND(AVG(IF(pattern_similarity <  60, pitch_velocity, NULL)), 1) AS avg_velo_when_sim_low,
-        COUNTIF(pattern_similarity >= 75)                                 AS n_high_sim_pitches,
-        COUNTIF(pattern_similarity <  60)                                 AS n_low_sim_pitches,
-        ROUND(100.0 * COUNTIF(pattern_similarity >= 75) / COUNT(*), 1)   AS pct_high_sim
+        ROUND(MAX(pitch_velocity),        1)  AS peak_velocity
       FROM `{scores_fq}`
       WHERE dataset_id         = @dataset_id
         AND feature_version    = @feature_version
         AND pitch_velocity      IS NOT NULL
         AND velocity_vs_baseline IS NOT NULL
+      GROUP BY player_full_name
+    ),
+
+    -- Per-player pattern-similarity quartiles. A fixed global threshold (e.g.
+    -- sim >= 75%) is too strict for most individual players -- fewer than 2%
+    -- of all pitches ever reach it -- so "high sim" / "low sim" is defined
+    -- relative to each player's own distribution instead (best 25% vs worst 25%).
+    sim_ranked AS (
+      SELECT
+        player_full_name,
+        pitch_velocity,
+        NTILE(4) OVER (
+          PARTITION BY player_full_name ORDER BY pattern_similarity DESC
+        ) AS sim_quartile
+      FROM `{scores_fq}`
+      WHERE dataset_id         = @dataset_id
+        AND feature_version    = @feature_version
+        AND pitch_velocity      IS NOT NULL
+        AND velocity_vs_baseline IS NOT NULL
+        AND pattern_similarity   IS NOT NULL
+    ),
+
+    sim_split AS (
+      SELECT
+        player_full_name,
+        ROUND(AVG(IF(sim_quartile = 1, pitch_velocity, NULL)), 1) AS avg_velo_when_sim_high,
+        ROUND(AVG(IF(sim_quartile = 4, pitch_velocity, NULL)), 1) AS avg_velo_when_sim_low,
+        COUNTIF(sim_quartile = 1)                                 AS n_high_sim_pitches,
+        COUNTIF(sim_quartile = 4)                                 AS n_low_sim_pitches,
+        ROUND(100.0 * COUNTIF(sim_quartile = 1) / COUNT(*), 1)   AS pct_high_sim
+      FROM sim_ranked
       GROUP BY player_full_name
     ),
 
@@ -316,15 +341,16 @@ def _build_coaching_summary(cfg: VelocityIntelConfig, client: bigquery.Client) -
       os.peak_velocity,
       vc.velocity_ceiling,
 
-      -- The money columns: velo split by mechanics quality
-      os.avg_velo_when_sim_high,
-      os.avg_velo_when_sim_low,
+      -- The money columns: velo split by mechanics quality (per-player
+      -- top-25%/bottom-25% pattern-similarity quartiles, see sim_split)
+      ss.avg_velo_when_sim_high,
+      ss.avg_velo_when_sim_low,
       ROUND(
-        COALESCE(os.avg_velo_when_sim_high, 0) - COALESCE(os.avg_velo_when_sim_low, 0), 1
+        COALESCE(ss.avg_velo_when_sim_high, 0) - COALESCE(ss.avg_velo_when_sim_low, 0), 1
       )                                          AS velo_gap,
-      os.n_high_sim_pitches,
-      os.n_low_sim_pitches,
-      os.pct_high_sim,
+      ss.n_high_sim_pitches,
+      ss.n_low_sim_pitches,
+      ss.pct_high_sim,
 
       -- Session meta
       sc.n_sessions,
@@ -349,18 +375,18 @@ def _build_coaching_summary(cfg: VelocityIntelConfig, client: bigquery.Client) -
 
       -- Human-readable coaching insight surfaced directly on the website
       CASE
-        WHEN os.avg_velo_when_sim_high IS NOT NULL
-          AND os.avg_velo_when_sim_low IS NOT NULL
-          AND ROUND(os.avg_velo_when_sim_high - os.avg_velo_when_sim_low, 1) > 0
+        WHEN ss.avg_velo_when_sim_high IS NOT NULL
+          AND ss.avg_velo_when_sim_low IS NOT NULL
+          AND ROUND(ss.avg_velo_when_sim_high - ss.avg_velo_when_sim_low, 1) > 0
         THEN CONCAT(
-          'When mechanics match your max-effort pattern (≥75% match), avg velocity is ',
-          CAST(os.avg_velo_when_sim_high AS STRING), ' mph — ',
-          CAST(ROUND(os.avg_velo_when_sim_high - os.avg_velo_when_sim_low, 1) AS STRING),
-          ' mph above when mechanics drift (<60% match).'
+          'When mechanics match your max-effort pattern (top 25% match), avg velocity is ',
+          CAST(ss.avg_velo_when_sim_high AS STRING), ' mph — ',
+          CAST(ROUND(ss.avg_velo_when_sim_high - ss.avg_velo_when_sim_low, 1) AS STRING),
+          ' mph above when mechanics drift (bottom 25% match).'
         )
-        WHEN os.avg_velo_when_sim_high IS NOT NULL
+        WHEN ss.avg_velo_when_sim_high IS NOT NULL
         THEN CONCAT(
-          'Max-effort mechanics average ', CAST(os.avg_velo_when_sim_high AS STRING),
+          'Max-effort mechanics average ', CAST(ss.avg_velo_when_sim_high AS STRING),
           ' mph. Keep tracking to build a full velocity-mechanics picture.'
         )
         ELSE 'Not enough data yet to compute a velocity coaching insight.'
@@ -371,6 +397,7 @@ def _build_coaching_summary(cfg: VelocityIntelConfig, client: bigquery.Client) -
     FROM baseline_meta bm
     JOIN  overall_stats     os ON bm.player_full_name = os.player_full_name
     JOIN  session_counts    sc ON bm.player_full_name = sc.player_full_name
+    LEFT JOIN sim_split     ss ON bm.player_full_name = ss.player_full_name
     LEFT JOIN last_session_stats ls ON bm.player_full_name = ls.player_full_name
     LEFT JOIN trend_calc    tc ON bm.player_full_name = tc.player_full_name
     LEFT JOIN velocity_ceiling vc ON bm.player_full_name = vc.player_full_name
